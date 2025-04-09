@@ -1,0 +1,79 @@
+[33mcommit fdbbf2412970290f14c394241844d61ad75c1fdd[m[33m ([m[1;36mHEAD -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author:     Garychaizx <149564498+Garychaizx@users.noreply.github.com>
+AuthorDate: Thu Apr 10 04:20:10 2025 +0800
+Commit:     Garychaizx <149564498+Garychaizx@users.noreply.github.com>
+CommitDate: Thu Apr 10 04:20:10 2025 +0800
+
+    implemented agents testing files and training files
+
+[33mcommit ef2980ab66a68b8b3fabc02766b3217062b2a3c6[m
+Author:     bingqian0328 <bqlim2004@gmail.com>
+AuthorDate: Tue Apr 1 00:52:34 2025 +0800
+Commit:     bingqian0328 <bqlim2004@gmail.com>
+CommitDate: Tue Apr 1 00:52:34 2025 +0800
+
+    Initial commit
+
+[33mcommit 645aefa8a94f6016d8f6042a0391233f29232130[m
+Author:     bingqian0328 <bqlim2004@gmail.com>
+AuthorDate: Sat Mar 29 17:10:58 2025 +0800
+Commit:     bingqian0328 <bqlim2004@gmail.com>
+CommitDate: Sat Mar 29 17:10:58 2025 +0800
+
+    Initial commit: Integrated with siren model
+
+[33mcommit 2f6319c45e9fc5f781b040c4a3bdf3cfa131fab2[m
+Author:     Georgi Kolev <g.t.kolev1@gmail.com>
+AuthorDate: Sat Feb 24 09:22:29 2024 +0200
+Commit:     Georgi Kolev <g.t.kolev1@gmail.com>
+CommitDate: Sat Feb 24 09:22:29 2024 +0200
+
+    Saved trained models
+
+[33mcommit 5efd5dfc47ace9e5d6ec723181d01888ca777556[m
+Author:     Georgi Kolev <g.t.kolev1@gmail.com>
+AuthorDate: Fri Feb 23 21:58:11 2024 +0200
+Commit:     Georgi Kolev <g.t.kolev1@gmail.com>
+CommitDate: Fri Feb 23 21:58:11 2024 +0200
+
+    Fixed bugs and added different agent
+
+[33mcommit 06bf56e07b12efb73dc49dcaf26b6e3bfb26cac7[m
+Author:     mchtilianov <martin@chtilianov.com>
+AuthorDate: Fri Feb 23 17:15:05 2024 +0200
+Commit:     mchtilianov <martin@chtilianov.com>
+CommitDate: Fri Feb 23 17:15:05 2024 +0200
+
+    Added Proximal Policy Optimization for the RL Agents Training
+
+[33mcommit 31416c2421188f6f582201a9797c226e34532a1e[m
+Author:     Georgi Kolev <g.t.kolev1@gmail.com>
+AuthorDate: Thu Feb 22 21:57:17 2024 +0200
+Commit:     Georgi Kolev <g.t.kolev1@gmail.com>
+CommitDate: Thu Feb 22 21:57:17 2024 +0200
+
+    Q-learning works but not with good results
+
+[33mcommit 6e34c6d83fd4ca9d79afb49250dbaf5ab7e61ed5[m
+Author:     Georgi Kolev <g.t.kolev1@gmail.com>
+AuthorDate: Thu Feb 22 19:49:54 2024 +0200
+Commit:     Georgi Kolev <g.t.kolev1@gmail.com>
+CommitDate: Thu Feb 22 19:49:54 2024 +0200
+
+    Fixed Q-learning agent bugs. Added more logic
+
+[33mcommit 6e543ca27f85036799b38f9453a33cc28ed0f38c[m
+Author:     Georgi Kolev <g.t.kolev1@gmail.com>
+AuthorDate: Wed Feb 21 23:05:39 2024 +0200
+Commit:     Georgi Kolev <g.t.kolev1@gmail.com>
+CommitDate: Wed Feb 21 23:05:39 2024 +0200
+
+    Add Q-learning agent (not fully-ready yet) and implement logic for finding traffic lights neighbours
+
+[33mcommit 06fe6e3ec19646015652b49228cb1a0f37a57283[m
+Author:     Georgi Kolev <g.t.kolev1@gmail.com>
+AuthorDate: Thu Feb 15 21:50:07 2024 +0200
+Commit:     Georgi Kolev <g.t.kolev1@gmail.com>
+CommitDate: Thu Feb 15 21:50:07 2024 +0200
+
+    Initial commit
