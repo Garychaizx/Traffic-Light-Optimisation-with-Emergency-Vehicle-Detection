@@ -1,12 +1,16 @@
-import sumo_rl
+# ppo_testing_with_metrics.py
+
+import os
 import numpy as np
 import torch
-from matplotlib import pyplot as plt
-from tensorflow.keras.models import load_model
-import librosa
-import os
+import sumo_rl
+import traci
 from agents.ppo_agent import PPO
+import matplotlib.pyplot as plt
+import pandas as pd  # for performance metrics table
 import random
+import librosa
+from tensorflow.keras.models import load_model
 
 # === Siren Detection ===
 def extract_features(audio_file, max_pad_len=862):
@@ -45,7 +49,7 @@ except Exception as e:
 # === SUMO Environment ===
 env = sumo_rl.SumoEnvironment(
     net_file='nets/intersection/environment.net.xml',
-    route_file='nets/intersection/episode_routes.rou.xml',
+    route_file='nets/intersection/episode_routes_low.rou.xml',
     use_gui=True,
     num_seconds=5000,
     single_agent=False
@@ -63,7 +67,7 @@ agent = PPO(state_dim, num_phases, hidden_size=64, lr=3e-4, gamma=0.99, clip_rat
 agent.actor_critic.load_state_dict(torch.load('trained_models/model_ppo.pth'))
 agent.actor_critic.eval()
 
-# === Testing Loop ===
+# === initialize performance metric containers ===
 done = {"__all__": False}
 rewards = []
 queue_lengths = []
@@ -71,8 +75,29 @@ phase_counts = {p: 0 for p in range(num_phases)}
 i = 0
 state = observations[tl_id]
 
+# new metric lists
+travel_times = []
+depart_times = {}
+waiting_times = []
+ev_waited = set()
+ev_waiting_times = []
+
+# === Testing Loop ===
 while not done["__all__"]:
     i += 1
+
+    # --- record departures & arrivals for travel time & EV wait capture ---
+    for vid in traci.simulation.getDepartedIDList():
+        depart_times[vid] = i
+    for vid in traci.simulation.getArrivedIDList():
+        if vid in depart_times:
+            travel_times.append(i - depart_times[vid])
+            try:
+                if traci.vehicle.getTypeID(vid) == "emergency_veh":
+                    ev_waiting_times.append(traci.vehicle.getWaitingTime(vid))
+            except:
+                pass
+            del depart_times[vid]
 
     current_phase = env.traffic_signals[tl_id].green_phase
     valid_phases = [p for p in range(num_phases) if (current_phase, p) in env.traffic_signals[tl_id].yellow_dict]
@@ -113,6 +138,20 @@ while not done["__all__"]:
     total_queue = sum(env.sumo.lane.getLastStepHaltingNumber(lane) for lane in incoming_lanes)
     queue_lengths.append(total_queue)
 
+    # record avg waiting time this step & track EVs that had to stop
+    veh_ids = env.sumo.vehicle.getIDList()
+    if veh_ids:
+        wt = [traci.vehicle.getWaitingTime(v) for v in veh_ids]
+        waiting_times.append(sum(wt) / len(wt))
+    else:
+        waiting_times.append(0.0)
+
+    for v in veh_ids:
+        if traci.vehicle.getTypeID(v) == "emergency_veh" and traci.vehicle.getWaitingTime(v) > 0:
+            if v not in ev_waited:
+                ev_waited.add(v)
+                ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
+
     print(f"Step {i}: Reward = {reward:.2f}, Phase = {action}, Queue Length = {total_queue}")
 
 # === Summary ===
@@ -121,6 +160,19 @@ print(f"Average reward: {np.mean(rewards):.2f}")
 print("\nPhase usage:")
 for p, count in phase_counts.items():
     print(f"Phase {p}: {count} times")
+
+# === performance metrics summary ===
+summary = {
+    "wait time (sec)":     np.mean(waiting_times),
+    "travel time (sec)":   np.mean(travel_times),
+    "queue length (cars)": np.mean(queue_lengths),
+    "reward":              np.mean(rewards),
+    "EV stopped count":    len(ev_waited),
+    "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
+}
+df_summary = pd.DataFrame([summary])
+print("\nPerformance metrics")
+print(df_summary.to_markdown(index=False, floatfmt=".3f"))
 
 # === Plotting ===
 plt.figure(figsize=(10, 4))
@@ -142,3 +194,5 @@ plt.grid(True)
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+env.close()

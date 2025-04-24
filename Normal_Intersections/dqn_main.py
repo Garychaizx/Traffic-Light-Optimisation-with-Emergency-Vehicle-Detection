@@ -173,7 +173,7 @@ def main():
 
     # 9) save & plot
     os.makedirs("trained_models", exist_ok=True)
-    agent.save("trained_models/model_dqn_adaptive_fixed2.pth")
+    agent.save("trained_models/model_dqn.pth")
     print("✅ Done. Saved to trained_models/model_dqn_adaptive_fixed2.pth")
 
     plt.figure(figsize=(8,4))

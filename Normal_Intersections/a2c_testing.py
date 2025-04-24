@@ -7,6 +7,9 @@ import os
 from agents.a2c_agent import A2CAgent
 import random
 from tensorflow.keras.models import load_model
+import pandas as pd  # for performance metrics table
+import traci
+
 # === Siren Detection ===
 def extract_features(audio_file, max_pad_len=862):
     try:
@@ -44,7 +47,7 @@ except Exception as e:
 # === SUMO Environment ===
 env = sumo_rl.SumoEnvironment(
     net_file='nets/intersection/environment.net.xml',
-    route_file='nets/intersection/episode_routes.rou.xml',
+    route_file='nets/intersection/episode_routes_low.rou.xml',
     use_gui=True,
     num_seconds=5000,
     single_agent=False
@@ -72,11 +75,32 @@ phase_counts = {p: 0 for p in range(num_phases)}
 i = 0
 state = observations[tl_id]
 
+# === performance metric containers ===
+travel_times = []
+depart_times = {}
+waiting_times = []
+ev_waited = set()
+ev_waiting_times = []
+
 while not done["__all__"]:
     i += 1
 
+    # record departures & arrivals for travel time & EV wait
+    for vid in traci.simulation.getDepartedIDList():
+        depart_times[vid] = i
+    for vid in traci.simulation.getArrivedIDList():
+        if vid in depart_times:
+            travel_times.append(i - depart_times[vid])
+            try:
+                if traci.vehicle.getTypeID(vid) == "emergency_veh":
+                    ev_waiting_times.append(traci.vehicle.getWaitingTime(vid))
+            except:
+                pass
+            del depart_times[vid]
+
     current_phase = env.traffic_signals[tl_id].green_phase
-    valid_phases = [p for p in range(num_phases) if (current_phase, p) in env.traffic_signals[tl_id].yellow_dict]
+    valid_phases = [p for p in range(num_phases)
+                    if (current_phase, p) in env.traffic_signals[tl_id].yellow_dict]
     if not valid_phases:
         valid_phases = [current_phase]
 
@@ -98,7 +122,6 @@ while not done["__all__"]:
         elif emergency_dir.startswith("E2TL") or emergency_dir.startswith("W2TL"):
             action = 2
     else:
-        # Use the A2C agent's policy to select the action, passing both state and valid_phases
         action = agent.choose_action(state, valid_phases)
         if action not in valid_phases:
             action = random.choice(valid_phases)
@@ -112,11 +135,25 @@ while not done["__all__"]:
     rewards.append(reward)
 
     incoming_lanes = env.sumo.trafficlight.getControlledLanes(tl_id)
-    total_queue = sum(env.sumo.lane.getLastStepHaltingNumber(lane) for lane in incoming_lanes)
+    total_queue = sum(env.sumo.lane.getLastStepHaltingNumber(lane)
+                      for lane in incoming_lanes)
     queue_lengths.append(total_queue)
 
-    print(f"Step {i}: Reward = {reward:.2f}, Phase = {action}, Queue Length = {total_queue}")
+    # record avg waiting time this step & track EVs that stopped
+    veh_ids = env.sumo.vehicle.getIDList()
+    if veh_ids:
+        wt = [traci.vehicle.getWaitingTime(v) for v in veh_ids]
+        waiting_times.append(sum(wt) / len(wt))
+    else:
+        waiting_times.append(0.0)
 
+    for v in veh_ids:
+        if traci.vehicle.getTypeID(v) == "emergency_veh" and traci.vehicle.getWaitingTime(v) > 0:
+            if v not in ev_waited:
+                ev_waited.add(v)
+                ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
+
+    print(f"Step {i}: Reward = {reward:.2f}, Phase = {action}, Queue Length = {total_queue}")
 
 # === Summary ===
 print("\n✅ Evaluation completed.")
@@ -124,6 +161,19 @@ print(f"Average reward: {np.mean(rewards):.2f}")
 print("\nPhase usage:")
 for p, count in phase_counts.items():
     print(f"Phase {p}: {count} times")
+
+# === Performance metrics summary ===
+summary = {
+    "wait time (sec)":     np.mean(waiting_times),
+    "travel time (sec)":   np.mean(travel_times),
+    "queue length (cars)": np.mean(queue_lengths),
+    "reward":              np.mean(rewards),
+    "EV stopped count":    len(ev_waited),
+    "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
+}
+df_summary = pd.DataFrame([summary])
+print("\nPerformance metrics")
+print(df_summary.to_markdown(index=False, floatfmt=".3f"))
 
 # === Plotting ===
 plt.figure(figsize=(10, 4))
@@ -145,3 +195,5 @@ plt.grid(True)
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+env.close()

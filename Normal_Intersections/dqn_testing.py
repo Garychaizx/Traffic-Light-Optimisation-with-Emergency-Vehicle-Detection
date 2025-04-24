@@ -1,4 +1,4 @@
-# dqn_testing_fixed.py
+# dqn_testing_fixed_with_metrics.py
 
 import os
 import numpy as np
@@ -7,7 +7,8 @@ import sumo_rl
 import traci
 from agents.dqn_agent import DQNAgent
 import matplotlib.pyplot as plt
-
+import pandas as pd  # for performance metrics table
+from traci.exceptions import TraCIException
 # === siren detection machinery ===
 import librosa
 from tensorflow.keras.models import load_model
@@ -45,14 +46,14 @@ except:
 # === build SUMO env (no traci connection yet) ===
 env = sumo_rl.SumoEnvironment(
     net_file    = 'nets/intersection/environment.net.xml',
-    route_file  = 'nets/intersection/episode_routes.rou.xml',
+    route_file  = 'nets/intersection/episode_routes_low.rou.xml',
     use_gui     = True,
     num_seconds = 5000,
     single_agent=False
 )
-tl_id       = env.ts_ids[0]
-phases      = env.traffic_signals[tl_id].all_phases
-num_phases  = len(phases)
+tl_id      = env.ts_ids[0]
+phases     = env.traffic_signals[tl_id].all_phases
+num_phases = len(phases)
 
 # === reset once to start SUMO & traci ===
 obs0 = env.reset()
@@ -61,7 +62,6 @@ obs0 = env.reset()
 ctrl_lanes = traci.trafficlight.getControlledLanes(tl_id)
 lanes_by_phase = []
 for ph in phases:
-    # one char per controlled lane; 'G' or 'g' means green
     serve = [
         lane for lane, sig in zip(ctrl_lanes, ph.state)
         if sig.upper() == 'G'
@@ -74,28 +74,49 @@ state_dim = base_dim + num_phases
 
 # === instantiate your agent and load weights ===
 agent = DQNAgent(state_dim, num_phases)
-agent.load('trained_models/model_dqn_adaptive_fixed2.pth')
+agent.load('trained_models/model_dqn.pth')
 agent.epsilon = 0.0   # full greedy for evaluation
 
-# === ready to roll ===
-state_dict   = obs0
-state_raw    = state_dict[tl_id]
-# initial queue features
-queues0      = np.array([
+# === initialize performance metric containers ===
+rewards           = []
+queue_lengths     = []
+phase_counts      = {p:0 for p in range(num_phases)}
+done              = {"__all__": False}
+step              = 0
+
+# new metric lists
+travel_times      = []
+depart_times      = {}
+waiting_times     = []
+ev_waited         = set()
+ev_waiting_times  = []
+
+# === initial state ===
+state_dict  = obs0
+state_raw   = state_dict[tl_id]
+queues0     = np.array([
     sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes_by_phase[p])
     for p in range(num_phases)
 ], dtype=float)
-queue_feat0  = queues0 / (queues0.max() + 1e-3)
-state        = np.concatenate([state_raw, queue_feat0])
+queue_feat0 = queues0 / (queues0.max() + 1e-3)
+state       = np.concatenate([state_raw, queue_feat0])
 
-rewards      = []
-queue_lengths= []
-phase_counts = {p:0 for p in range(num_phases)}
-done         = {"__all__": False}
-step         = 0
-
+# ===== Evaluation Loop =====
 while not done["__all__"]:
     step += 1
+
+    # --- record departures & arrivals for travel time & EV wait capture ---
+    for vid in traci.simulation.getDepartedIDList():
+        depart_times[vid] = step
+    for vid in traci.simulation.getArrivedIDList():
+        if vid in depart_times:
+            travel_times.append(step - depart_times[vid])
+            try:
+                if traci.vehicle.getTypeID(vid) == "emergency_veh":
+                    ev_waiting_times.append(traci.vehicle.getWaitingTime(vid))
+            except TraCIException:
+                pass
+            del depart_times[vid]
 
     # figure out valid yellow transitions
     curr_phase = env.traffic_signals[tl_id].green_phase
@@ -108,20 +129,17 @@ while not done["__all__"]:
 
     # check for emergency override
     override = False
+    road     = None
     for vid in env.sumo.vehicle.getIDList():
         if env.sumo.vehicle.getTypeID(vid) == "emergency_veh":
             dist = 750 - env.sumo.vehicle.getLanePosition(vid)
             if dist < 100 and detect_siren(siren_model):
                 override = True
-                road = env.sumo.vehicle.getRoadID(vid)
+                road     = env.sumo.vehicle.getRoadID(vid)
                 break
 
     if override:
-        # force N-S straight (phase 0) or E-W straight (phase 2)
-        if road.startswith(("N2TL","S2TL")):
-            action = 0
-        else:
-            action = 2
+        action = 0 if road.startswith(("N2TL","S2TL")) else 2
     else:
         action = agent.choose_action(state, valid)
 
@@ -129,10 +147,10 @@ while not done["__all__"]:
 
     # step environment
     obs2, rdict, done, _ = env.step({tl_id: action})
-    base_r = rdict[tl_id]
-    rewards.append(base_r)
+    r = rdict[tl_id]
+    rewards.append(r)
 
-    # compute total queue on **all** incoming lanes
+    # compute total queue on all incoming lanes
     all_lanes = traci.trafficlight.getControlledLanes(tl_id)
     total_q   = sum(
         traci.lane.getLastStepHaltingNumber(l)
@@ -140,22 +158,49 @@ while not done["__all__"]:
     )
     queue_lengths.append(total_q)
 
-    print(f"Step {step}: reward={base_r:.2f} phase={action} total_queue={total_q}")
+    print(f"Step {step}: reward={r:.2f} phase={action} total_queue={total_q}")
 
-    # build next state: raw obs + per-phase queue features
-    raw2 = obs2[tl_id]
+    # record avg waiting time this step & track EVs that had to stop
+    veh_ids = env.sumo.vehicle.getIDList()
+    if veh_ids:
+        wt = [traci.vehicle.getWaitingTime(v) for v in veh_ids]
+        waiting_times.append(sum(wt)/len(wt))
+    else:
+        waiting_times.append(0.0)
+
+    for v in veh_ids:
+        if traci.vehicle.getTypeID(v) == "emergency_veh" and traci.vehicle.getWaitingTime(v) > 0:
+            if v not in ev_waited:
+                ev_waited.add(v)
+                ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
+
+    # build next state
+    raw2    = obs2[tl_id]
     queues2 = np.array([
         sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes_by_phase[p])
         for p in range(num_phases)
     ], dtype=float)
-    feat2 = queues2 / (queues2.max() + 1e-3)
-    state = np.concatenate([raw2, feat2])
+    feat2   = queues2 / (queues2.max() + 1e-3)
+    state   = np.concatenate([raw2, feat2])
 
 # === done ===
 print("\n✅ Evaluation complete")
 print(f"Avg. reward: {np.mean(rewards):.2f}")
 for p, c in phase_counts.items():
     print(f"Phase {p}: {c} times")
+
+# === performance metrics summary ===
+summary = {
+    "wait time (sec)":     np.mean(waiting_times),
+    "travel time (sec)":   np.mean(travel_times),
+    "queue length (cars)": np.mean(queue_lengths),
+    "reward":              np.mean(rewards),
+    "EV stopped count":    len(ev_waited),
+    "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
+}
+df_summary = pd.DataFrame([summary])
+print("\nPerformance metrics")
+print(df_summary.to_markdown(index=False, floatfmt=".3f"))
 
 # === plots ===
 plt.figure(figsize=(10,4))
