@@ -1,12 +1,48 @@
 # test_double_intersection_ppo.py
 
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
 import sumo_rl
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agents.ppo_agent import PPO
 from matplotlib import pyplot as plt
+import librosa
+from tensorflow.keras.models import load_model
+
+# === Emergency Detection Functions ===
+def extract_features(audio_file, max_pad_len=862):
+    try:
+        audio, sr = librosa.load(audio_file, res_type='kaiser_fast')
+        mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=80)
+        pad_width = max_pad_len - mfccs.shape[1]
+        if pad_width > 0:
+            mfccs = np.pad(mfccs, ((0, 0), (0, pad_width)), mode='constant')
+        else:
+            mfccs = mfccs[:, :max_pad_len]
+        return np.mean(mfccs, axis=1).reshape(1, 1, 80)
+    except Exception as e:
+        print(f"❌ Error extracting features: {e}")
+        return None
+
+def detect_siren(model):
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'dynamic_sounds', 'ambulance.wav'))
+    if model is None or not os.path.exists(path):
+        print(f"❌ Siren model not loaded or audio file missing: {path}")
+        return False
+    feats = extract_features(path)
+    if feats is None:
+        print("❌ Failed to extract features from audio")
+        return False
+    try:
+        prediction = float(model.predict(feats)[0][0])
+        print(f"🔊 Siren detection confidence: {prediction}")
+        return prediction > 0.5
+    except Exception as e:
+        print(f"❌ Error during siren detection: {e}")
+        return False
 
 def build_neighbours(env):
     """
@@ -15,16 +51,14 @@ def build_neighbours(env):
     """
     ts = env.ts_ids
     neigh = {tl: [] for tl in ts}
-    # must call env.reset() first so env.sumo is initialized
     for edge_id in env.sumo.edge.getIDList():
         if len(edge_id) == 2 and edge_id[0] in ts and edge_id[1] in ts:
             a, b = edge_id[0], edge_id[1]
             neigh[a].append(b)
             neigh[b].append(a)
-    # convert lists to arrays (optional)
     return {tl: np.array(v) for tl, v in neigh.items()}
 
-def prepare_obs(obs, tl, neighbours, pad_len=165):
+def prepare_obs(obs, tl, neighbours, pad_len=181):
     """
     Concatenate own obs plus 0.2× neighbours’ obs, then pad/truncate.
     Returns a torch.FloatTensor.
@@ -39,7 +73,15 @@ def prepare_obs(obs, tl, neighbours, pad_len=165):
     return torch.FloatTensor(x)
 
 def main():
-    # 1) create the SUMO env (GUI on for visualization)
+    # 1) Load the siren model if it exists
+    try:
+        siren_model = load_model('siren_model/best_model.keras')
+        print("✅ Siren model loaded")
+    except Exception as e:
+        siren_model = None
+        print(f"⚠️  No siren model, skipping override: {e}")
+
+    # 2) Create the SUMO environment (GUI on for visualization)
     env = sumo_rl.SumoEnvironment(
         net_file    = "nets/double/network.net.xml",
         route_file  = "nets/double/doubleRoutes.rou.xml",
@@ -48,17 +90,16 @@ def main():
         single_agent=False
     )
 
-    # 2) initialize and build neighbour map
+    # 3) Initialize and build neighbour map
     obs = env.reset()
     neighbours = build_neighbours(env)
 
-    # 3) load each TL’s trained PPO agent
+    # 4) Load each TL’s trained PPO agent
     agents = {}
     for tl in env.ts_ids:
         n_phases = len(env.traffic_signals[tl].all_phases)
-        # instantiate with the same hyperparams used during training:
         agent = PPO(
-            state_dim   = 165,
+            state_dim   = 181,
             action_dim  = n_phases,
             hidden_size = 64,
             lr          = 3e-4,
@@ -67,12 +108,11 @@ def main():
             K_epoch     = 4
         )
         ckpt = f"trained_models/ppo_double_{tl}.pth"
-        # load into actor_critic
         agent.actor_critic.load_state_dict(torch.load(ckpt))
         agent.actor_critic.eval()
         agents[tl] = agent
 
-    # 4) run one test episode
+    # 5) Run one test episode
     obs = env.reset()
     state = {tl: prepare_obs(obs, tl, neighbours) for tl in env.ts_ids}
 
@@ -89,30 +129,60 @@ def main():
         step += 1
         actions = {}
 
-        # choose a greedy, valid phase for each TL
+        # Choose a greedy, valid phase for each TL with emergency override
         for tl, agent in agents.items():
-            s = state[tl].unsqueeze(0)           # [1,165]
+            s = state[tl].unsqueeze(0)  # [1,165]
             with torch.no_grad():
                 logits, _ = agent.actor_critic(s)
                 probs = F.softmax(logits, dim=-1).squeeze(0)  # [n_phases]
-            # mask invalid transitions
+
+            # Mask invalid transitions
             curr = env.traffic_signals[tl].green_phase
             valid = [p for p in range(probs.size(0))
                      if (curr, p) in env.traffic_signals[tl].yellow_dict]
-            # pick highest‐prob among valid
-            best = torch.argmax(probs).item()
-            action = best if best in valid else curr
+            mask = torch.zeros_like(probs)
+            mask[valid] = 1.0
+            masked = probs * mask
+            if masked.sum() == 0:
+                masked[valid] = 1.0 / len(valid)
+            else:
+                masked /= masked.sum()
+
+            # Emergency vehicle detection logic
+            override = False
+            road = None
+            for vid in env.sumo.vehicle.getIDList():
+                vehicle_type = env.sumo.vehicle.getTypeID(vid)
+                route = env.sumo.vehicle.getRoute(vid)
+                position = env.sumo.vehicle.getLanePosition(vid)
+                print(f"Vehicle ID: {vid}, Type: {vehicle_type}, Route: {route}, Position: {position}")
+
+                if vehicle_type == "emergency":
+                    if detect_siren(siren_model):
+                        print(f"🚑 Emergency vehicle detected on route {route}")
+                        override = True
+                        road = route[0]  # Get the first edge of the route
+                        break
+
+            if override:
+                # Force a specific phase based on the emergency vehicle's direction
+                action = 0 if road.startswith(("N2TL", "S2TL")) else 2
+                print(f"🚦 Forcing phase {action} for road {road}")
+            else:
+                action = int(masked.argmax().item())
+                print(f"🤖 Chosen action: {action}")
+
             phase_counts[tl][action] += 1
             actions[tl] = action
 
-        # step env
+        # Step environment
         obs2, reward_dict, done, _ = env.step(actions)
 
-        # record metrics
+        # Record metrics
         avg_r = np.mean(list(reward_dict.values()))
         rewards.append(avg_r)
 
-        # average queue over all TLs
+        # Average queue over all TLs
         total_q = 0
         for tl in env.ts_ids:
             lanes = env.sumo.trafficlight.getControlledLanes(tl)
@@ -121,10 +191,10 @@ def main():
 
         print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {queues[-1]: .1f}")
 
-        # prepare next state
+        # Prepare next state
         state = {tl: prepare_obs(obs2, tl, neighbours) for tl in env.ts_ids}
 
-    # 5) summary
+    # 6) Summary
     print("\n✅ Testing done")
     print(f"Mean reward over episode: {np.mean(rewards):.3f}")
     print(f"Mean queue   over episode: {np.mean(queues):.1f}")
@@ -133,7 +203,7 @@ def main():
         for p, c in phase_counts[tl].items():
             print(f"  Phase {p}: {c}")
 
-    # 6) plots
+    # 7) Plots
     plt.figure(figsize=(10,4))
     plt.plot(rewards, label="Avg Reward")
     plt.xlabel("Step"); plt.ylabel("Reward"); plt.title("PPO Testing: Rewards")
