@@ -101,7 +101,7 @@
 	<flow id="car_HF" type="car" route="HF" begin="0" end="86400" probability="0.016" />
 	<flow id="car_HG" type="car" route="HG" begin="0" end="86400" probability="0.017" />
 
-	<!-- <flow id="emergency_AC" type="emergency" route="AC" begin="0" end="86400" probability="0.00051"/>
+	<flow id="emergency_AC" type="emergency" route="AC" begin="0" end="86400" probability="0.00051"/>
 	<flow id="emergency_AF" type="emergency" route="AF" begin="0" end="86400" probability="0.00054" />
 	<flow id="emergency_AD" type="emergency" route="AD" begin="0" end="86400" probability="0.00053" />
 	<flow id="emergency_AG" type="emergency" route="AG" begin="0" end="86400" probability="0.00054" />
@@ -130,7 +130,7 @@
 	<flow id="emergency_HC" type="emergency" route="HC" begin="0" end="86400" probability="0.00053" />
 	<flow id="emergency_HD" type="emergency" route="HD" begin="0" end="86400" probability="0.00052" />
 	<flow id="emergency_HF" type="emergency" route="HF" begin="0" end="86400" probability="0.00056" />
-	<flow id="emergency_HG" type="emergency" route="HG" begin="0" end="86400" probability="0.00057" /> -->
+	<flow id="emergency_HG" type="emergency" route="HG" begin="0" end="86400" probability="0.00057" />
 
 
 </routes>

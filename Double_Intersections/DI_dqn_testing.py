@@ -1,11 +1,41 @@
 # test_dqn_double.py
 
 import os
+import sys
 import numpy as np
 import torch
 import sumo_rl
-from agents.dqn_agent import DQNAgent
 import matplotlib.pyplot as plt
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from agents.dqn_agent import DQNAgent
+import librosa
+from tensorflow.keras.models import load_model
+
+# === Emergency Detection Functions ===
+def extract_features(audio_file, max_pad_len=862):
+    try:
+        audio, sr = librosa.load(audio_file, res_type='kaiser_fast')
+        mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=80)
+        pad_width = max_pad_len - mfccs.shape[1]
+        if pad_width > 0:
+            mfccs = np.pad(mfccs, ((0, 0), (0, pad_width)), mode='constant')
+        else:
+            mfccs = mfccs[:, :max_pad_len]
+        return np.mean(mfccs, axis=1).reshape(1, 1, 80)
+    except:
+        return None
+
+def detect_siren(model):
+    path = "dynamic_sounds/ambulance.wav"
+    if model is None or not os.path.exists(path):
+        print("❌ Siren model not loaded or audio file missing")
+        return False
+    feats = extract_features(path)
+    if feats is None:
+        print("❌ Failed to extract features from audio")
+        return False
+    prediction = float(model.predict(feats)[0][0])
+    return prediction > 0.5
 
 def build_neighbours(env):
     """
@@ -38,7 +68,15 @@ def prepare_obs(obs, tl, neighbours, pad_len=165):
     return torch.FloatTensor(x)
 
 def main():
-    # 1) Create SUMO env with GUI
+    # 1) Load the siren model if it exists
+    try:
+        siren_model = load_model('siren_model/best_model.keras')
+        print("✅ Siren model loaded")
+    except:
+        siren_model = None
+        print("⚠️  No siren model, skipping override")
+
+    # 2) Create SUMO env with GUI
     env = sumo_rl.SumoEnvironment(
         net_file    = "nets/double/network.net.xml",
         route_file  = "nets/double/doubleRoutes.rou.xml",
@@ -51,7 +89,7 @@ def main():
     tls  = env.ts_ids
     neighbours = build_neighbours(env)
 
-    # 2) Load trained DQNAgent for each TL
+    # 3) Load trained DQNAgent for each TL
     agents = {}
     for tl in tls:
         n_phases = len(env.traffic_signals[tl].all_phases)
@@ -61,7 +99,7 @@ def main():
         agent.epsilon = 0.0   # fully greedy
         agents[tl] = agent
 
-    # 3) Run one test episode
+    # 4) Run one test episode
     state = {tl: prepare_obs(obs, tl, neighbours) for tl in tls}
     done  = {"__all__": False}
 
@@ -77,16 +115,40 @@ def main():
         step += 1
         actions = {}
 
-        # pick greedy valid action per TL
+        # pick greedy valid action per TL with emergency override
         for tl, agent in agents.items():
             curr = env.traffic_signals[tl].green_phase
             valid = [
                 p for p in range(agent.action_dim)
                 if (curr, p) in env.traffic_signals[tl].yellow_dict
             ]
-            a = agent.choose_action(state[tl], valid)
-            phase_counts[tl][a] += 1
-            actions[tl] = a
+
+            # Emergency vehicle detection logic
+            override = False
+            road = None
+            for vid in env.sumo.vehicle.getIDList():
+                vehicle_type = env.sumo.vehicle.getTypeID(vid)
+                route = env.sumo.vehicle.getRoute(vid)
+                position = env.sumo.vehicle.getLanePosition(vid)
+                print(f"Vehicle ID: {vid}, Type: {vehicle_type}, Route: {route}, Position: {position}")
+
+                if vehicle_type == "emergency":
+                    # dist = 750 - position  # Adjust this based on your simulation setup
+                    # if dist < 100 and detect_siren(siren_model):
+                    if detect_siren(siren_model):
+                        print(f"🚑 Emergency vehicle detected on route {route}")
+                        override = True
+                        road = route[0]  # Get the first edge of the route
+                        break
+
+            if override:
+                # Force a specific phase based on the emergency vehicle's direction
+                action = 0 if road.startswith(("N2TL", "S2TL")) else 2
+            else:
+                action = agent.choose_action(state[tl], valid)
+
+            phase_counts[tl][action] += 1
+            actions[tl] = action
 
         # step SUMO
         obs2, reward_dict, done, _ = env.step(actions)
@@ -107,7 +169,7 @@ def main():
         # prepare next state
         state = {tl: prepare_obs(obs2, tl, neighbours) for tl in tls}
 
-    # 4) Summary
+    # 5) Summary
     print("\n✅ Testing complete")
     print(f"Mean reward over episode: {np.mean(rewards):.3f}")
     print(f"Mean queue   over episode: {np.mean(queues):.1f}")
@@ -116,7 +178,7 @@ def main():
         for p, c in phase_counts[tl].items():
             print(f"  Phase {p}: {c}")
 
-    # 5) Plot results
+    # 6) Plot results
     plt.figure(figsize=(10,4))
     plt.plot(rewards, label="Average Reward")
     plt.xlabel("Step"); plt.ylabel("Reward")
