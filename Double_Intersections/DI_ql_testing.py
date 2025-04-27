@@ -430,7 +430,7 @@ def main():
         "wait time (sec)":     np.mean(waiting_times),
         "travel time (sec)":   np.mean(travel_times),
         "queue length (cars)": np.mean(queue_lengths),
-        "shaped reward":       np.mean(shaped_rewards),
+        "reward":       np.mean(shaped_rewards),
         "EV stopped count":    len(ev_waited),
         "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
     }

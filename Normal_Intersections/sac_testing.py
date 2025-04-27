@@ -233,7 +233,7 @@ print(df_summary.to_markdown(index=False, floatfmt=".3f"))
 plt.figure(figsize=(10,4))
 plt.plot(shaped_rewards, label='Reward', color='tab:blue')
 plt.xlabel('Step'); plt.ylabel('Reward')
-plt.title('SAC Evaluation: Shaped Rewards Over Time')
+plt.title('SAC Evaluation: Rewards Over Time')
 plt.grid(True); plt.legend(); plt.tight_layout()
 
 plt.figure(figsize=(10,4))

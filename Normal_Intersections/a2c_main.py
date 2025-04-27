@@ -156,8 +156,8 @@ while not done["__all__"]:
     print(f"Step {i}: Shaped Reward = {shaped_reward:.2f}, Base Reward = {base_reward:.2f}, Phase = {action}")
 
 # === Save the A2C model ===
-torch.save(agent.actor.state_dict(), 'trained_models/a2c_actorr.pth')
-torch.save(agent.critic.state_dict(), 'trained_models/a2c_criticc.pth')
+torch.save(agent.actor.state_dict(), 'trained_models/a2c_actor.pth')
+torch.save(agent.critic.state_dict(), 'trained_models/a2c_critic.pth')
 
 # === Plot Rewards ===
 plt.figure(figsize=(10, 4))
