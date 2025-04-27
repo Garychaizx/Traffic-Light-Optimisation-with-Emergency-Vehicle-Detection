@@ -94,6 +94,16 @@ def main():
     QUEUE_PEN   = 0.3   # penalize the largest queue anywhere
     SERVE_BONUS = 0.2   # bonus for number of cars cleared on chosen phase
 
+    # Define shaping weights
+    QUEUE_PEN = 0.3          # Penalize the largest queue
+    SERVE_BONUS = 0.2        # Bonus for clearing vehicles
+    PHASE_CHANGE_PEN = 0.05  # Penalize phase changes
+    EMERGENCY_BONUS = 1.0    # Bonus for emergency vehicle handling
+    GAMMA = 0.99             # Discount factor for potential-based shaping
+
+    # Initialize variables for shaping
+    prev_total_queue = 0
+
     obs     = obs0
     done    = {"__all__": False}
     rewards = []
@@ -121,9 +131,10 @@ def main():
         if not valid:
             valid = [curr]
 
-        if detect_siren(siren_model):
-            # force north–south straight if siren
-            action = 0 if curr in (0,1) else curr
+        emergency_override = detect_siren(siren_model)
+        if emergency_override:
+            # Force north–south straight if siren
+            action = 0 if curr in (0, 1) else curr
         else:
             action = agent.choose_action(state, valid)
 
@@ -141,12 +152,35 @@ def main():
         )
         cleared = max(0.0, before - after)
 
-        # shaped reward: penalize overall max‐queue but reward clears
+        # === Shaped Reward Calculation ===
+        # 1. Queue penalty
+        total_queue = queue_per_phase.sum()
+        queue_penalty = -QUEUE_PEN * queue_per_phase.max()
+
+        # 2. Bonus for clearing vehicles
+        clear_bonus = SERVE_BONUS * cleared
+
+        # 3. Phase change penalty
+        phase_change_penalty = -PHASE_CHANGE_PEN if action != curr else 0.0
+
+        # 4. Emergency vehicle bonus
+        emergency_bonus = EMERGENCY_BONUS if emergency_override else 0.0
+
+        # 5. Potential-based shaping
+        potential_diff = GAMMA * (-total_queue) - (-prev_total_queue)
+
+        # Combine all components into the shaped reward
         shaped_r = (
             base_r
-            - QUEUE_PEN * queue_per_phase.max()
-            + SERVE_BONUS * cleared
+            + queue_penalty
+            + clear_bonus
+            + phase_change_penalty
+            + emergency_bonus
+            + potential_diff
         )
+
+        # Update previous total queue
+        prev_total_queue = total_queue
 
         # –– store & train ––
         raw2 = obs2[tl_id]
@@ -161,11 +195,12 @@ def main():
         agent.update_model()
 
         obs     = obs2
-        rewards.append(base_r)
+        rewards.append(shaped_r)
 
         if step % 100 == 0:
             print(
                 f"Step {step:4d} | base_r {base_r:.2f} "
+                f"| shaped_r {shaped_r:.2f} "
                 f"| maxQ {queue_per_phase.max():.1f} "
                 f"| cleared {cleared:.1f} "
                 f"| ε {agent.epsilon:.3f}"
@@ -174,13 +209,13 @@ def main():
     # 9) save & plot
     os.makedirs("trained_models", exist_ok=True)
     agent.save("trained_models/model_dqn.pth")
-    print("✅ Done. Saved to trained_models/model_dqn_adaptive_fixed2.pth")
+    print("✅ Done. Saved to trained_models/model_dqn.pth")
 
     plt.figure(figsize=(8,4))
     plt.plot(rewards)
     plt.xlabel("Step")
-    plt.ylabel("Base Reward")
-    plt.title("DQN Training (adaptive fairness shaping)")
+    plt.ylabel("Reward")
+    plt.title("DQN Training (Reward)")
     plt.grid(True)
     plt.tight_layout()
     plt.show()
