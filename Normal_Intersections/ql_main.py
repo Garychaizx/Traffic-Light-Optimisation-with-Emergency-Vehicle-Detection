@@ -8,6 +8,7 @@ from tensorflow.keras.models import load_model
 import librosa
 import os
 from generator import TrafficGenerator
+import traci
 
 gen = TrafficGenerator(max_steps=5000, n_cars_generated=1000)
 gen.generate_routefile(seed=42)
@@ -49,7 +50,7 @@ except Exception as e:
 # === SUMO Environment ===
 env = sumo_rl.SumoEnvironment(
     net_file='nets/intersection/environment.net.xml',
-    route_file='nets/intersection/episode_routes.rou.xml',
+    route_file='nets/intersection/episode_routes_high.rou.xml',
     use_gui=True,
     num_seconds=5000,
     single_agent=False
@@ -76,6 +77,16 @@ avg_rewards = []
 
 # === Phase coverage control ===
 phase_visit_count = {p: 0 for p in range(num_phases)}
+
+# Define shaping weights
+QUEUE_PENALTY = 0.3          # Penalize the largest queue
+CLEAR_BONUS = 0.2            # Bonus for clearing vehicles
+PHASE_CHANGE_PENALTY = 0.05  # Penalize phase changes
+EMERGENCY_BONUS = 1.0        # Bonus for emergency vehicle handling
+GAMMA = 0.9                  # Discount factor for potential-based shaping
+
+# Initialize variables for shaping
+prev_total_queue = 0
 
 # === Training Loop ===
 done = {"__all__": False}
@@ -116,13 +127,57 @@ while not done["__all__"]:
 
     phase_visit_count[action] += 1
 
+    # Measure queue before the action
+    before_queue = sum(
+        traci.lane.getLastStepHaltingNumber(l)
+        for l in traci.trafficlight.getControlledLanes(tl_id)
+    )
+
+    # Step the environment
     actions = {tl_id: action}
     observations, rewards, done, infos = env.step(actions)
+    next_input_tensor = torch.FloatTensor(observations[tl_id])
+    base_reward = rewards[tl_id]
+
+    # Measure queue after the action
+    after_queue = sum(
+        traci.lane.getLastStepHaltingNumber(l)
+        for l in traci.trafficlight.getControlledLanes(tl_id)
+    )
+    cleared_vehicles = max(0, before_queue - after_queue)
+
+    # === Shaped Reward Calculation ===
+    # 1. Queue penalty
+    queue_penalty = -QUEUE_PENALTY * before_queue
+
+    # 2. Bonus for clearing vehicles
+    clear_bonus = CLEAR_BONUS * cleared_vehicles
+
+    # 3. Phase change penalty
+    phase_change_penalty = -PHASE_CHANGE_PENALTY if action != current_phase else 0.0
+
+    # 4. Emergency vehicle bonus
+    emergency_bonus = EMERGENCY_BONUS if emergency_override else 0.0
+
+    # 5. Potential-based shaping
+    potential_diff = GAMMA * (-after_queue) - (-prev_total_queue)
+
+    # Combine all components into the shaped reward
+    shaped_reward = (
+        base_reward
+        + queue_penalty
+        + clear_bonus
+        + phase_change_penalty
+        + emergency_bonus
+        + potential_diff
+    )
+
+    # Update previous total queue
+    prev_total_queue = after_queue
 
     # Q-learning update
-    next_input_tensor = torch.FloatTensor(observations[tl_id])
     with torch.no_grad():
-        q_target = rewards[tl_id] + gamma * torch.max(agent.predict_rewards(next_input_tensor)[valid_phases])
+        q_target = shaped_reward + GAMMA * torch.max(agent.predict_rewards(next_input_tensor)[valid_phases])
     agent.learn(pred_rewards[action].unsqueeze(0), torch.tensor([q_target]))
 
     # Update state
@@ -132,8 +187,8 @@ while not done["__all__"]:
     if epsilon > min_epsilon:
         epsilon -= decay
 
-    avg_rewards.append(rewards[tl_id])
-    print(f"Step {i}: Reward = {rewards[tl_id]:.2f}, Action (phase): {action}")
+    avg_rewards.append(shaped_reward)
+    print(f"Step {i}: Shaped Reward = {shaped_reward:.2f}, Base Reward = {base_reward:.2f}, Action (phase): {action}")
 
 # === Save model ===
 torch.save(agent.model.state_dict(), 'trained_models/model_ql.pth')
@@ -142,8 +197,8 @@ torch.save(agent.model.state_dict(), 'trained_models/model_ql.pth')
 plt.figure(figsize=(9, 5))
 plt.plot(avg_rewards)
 plt.xlabel("Steps")
-plt.ylabel("Reward")
-plt.title("Q-Learning with Siren Override on Single Intersection")
+plt.ylabel("Shaped Reward")
+plt.title("Q-Learning with Shaped Rewards on Single Intersection")
 plt.grid(True)
 plt.tight_layout()
 plt.show()

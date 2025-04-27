@@ -46,7 +46,7 @@ except:
 # === build SUMO env (no traci connection yet) ===
 env = sumo_rl.SumoEnvironment(
     net_file    = 'nets/intersection/environment.net.xml',
-    route_file  = 'nets/intersection/episode_routes_low.rou.xml',
+    route_file  = 'nets/intersection/episode_routes_high.rou.xml',
     use_gui     = True,
     num_seconds = 5000,
     single_agent=False
@@ -91,6 +91,16 @@ waiting_times     = []
 ev_waited         = set()
 ev_waiting_times  = []
 
+# Define shaping weights
+QUEUE_PENALTY = 0.3          # Penalize the largest queue
+CLEAR_BONUS = 0.2            # Bonus for clearing vehicles
+PHASE_CHANGE_PENALTY = 0.05  # Penalize phase changes
+EMERGENCY_BONUS = 1.0        # Bonus for emergency vehicle handling
+GAMMA = 0.99                 # Discount factor for potential-based shaping
+
+# Initialize variables for shaping
+prev_total_queue = 0
+
 # === initial state ===
 state_dict  = obs0
 state_raw   = state_dict[tl_id]
@@ -105,7 +115,7 @@ state       = np.concatenate([state_raw, queue_feat0])
 while not done["__all__"]:
     step += 1
 
-    # --- record departures & arrivals for travel time & EV wait capture ---
+    # --- Record departures & arrivals for travel time & EV wait capture ---
     for vid in traci.simulation.getDepartedIDList():
         depart_times[vid] = step
     for vid in traci.simulation.getArrivedIDList():
@@ -118,7 +128,7 @@ while not done["__all__"]:
                 pass
             del depart_times[vid]
 
-    # figure out valid yellow transitions
+    # Figure out valid yellow transitions
     curr_phase = env.traffic_signals[tl_id].green_phase
     valid = [
         p for p in range(num_phases)
@@ -127,44 +137,88 @@ while not done["__all__"]:
     if not valid:
         valid = [curr_phase]
 
-    # check for emergency override
+    # Check for emergency override
     override = False
-    road     = None
+    road = None
     for vid in env.sumo.vehicle.getIDList():
         if env.sumo.vehicle.getTypeID(vid) == "emergency_veh":
             dist = 750 - env.sumo.vehicle.getLanePosition(vid)
             if dist < 100 and detect_siren(siren_model):
                 override = True
-                road     = env.sumo.vehicle.getRoadID(vid)
+                road = env.sumo.vehicle.getRoadID(vid)
                 break
 
     if override:
-        action = 0 if road.startswith(("N2TL","S2TL")) else 2
+        action = 0 if road.startswith(("N2TL", "S2TL")) else 2
     else:
         action = agent.choose_action(state, valid)
 
     phase_counts[action] += 1
 
-    # step environment
-    obs2, rdict, done, _ = env.step({tl_id: action})
-    r = rdict[tl_id]
-    rewards.append(r)
+    # Measure queue before the action
+    before_queue = sum(
+        traci.lane.getLastStepHaltingNumber(l)
+        for l in traci.trafficlight.getControlledLanes(tl_id)
+    )
 
-    # compute total queue on all incoming lanes
+    # Step the environment
+    obs2, rdict, done, _ = env.step({tl_id: action})
+    base_reward = rdict[tl_id]
+
+    # Measure queue after the action
+    after_queue = sum(
+        traci.lane.getLastStepHaltingNumber(l)
+        for l in traci.trafficlight.getControlledLanes(tl_id)
+    )
+    cleared_vehicles = max(0, before_queue - after_queue)
+
+    # === Shaped Reward Calculation ===
+    # 1. Queue penalty
+    queue_penalty = -QUEUE_PENALTY * before_queue
+
+    # 2. Bonus for clearing vehicles
+    clear_bonus = CLEAR_BONUS * cleared_vehicles
+
+    # 3. Phase change penalty
+    phase_change_penalty = -PHASE_CHANGE_PENALTY if action != curr_phase else 0.0
+
+    # 4. Emergency vehicle bonus
+    emergency_bonus = EMERGENCY_BONUS if override else 0.0
+
+    # 5. Potential-based shaping
+    potential_diff = GAMMA * (-after_queue) - (-prev_total_queue)
+
+    # Combine all components into the shaped reward
+    shaped_reward = (
+        base_reward
+        + queue_penalty
+        + clear_bonus
+        + phase_change_penalty
+        + emergency_bonus
+        + potential_diff
+    )
+
+    # Update previous total queue
+    prev_total_queue = after_queue
+
+    # Append shaped reward to rewards list
+    rewards.append(shaped_reward)
+
+    # Compute total queue on all incoming lanes
     all_lanes = traci.trafficlight.getControlledLanes(tl_id)
-    total_q   = sum(
+    total_queue = sum(
         traci.lane.getLastStepHaltingNumber(l)
         for l in all_lanes
     )
-    queue_lengths.append(total_q)
+    queue_lengths.append(total_queue)
 
-    print(f"Step {step}: reward={r:.2f} phase={action} total_queue={total_q}")
+    print(f"Step {step}: shaped_reward={shaped_reward:.2f}, base_reward={base_reward:.2f}, phase={action}, total_queue={total_queue}")
 
-    # record avg waiting time this step & track EVs that had to stop
+    # Record avg waiting time this step & track EVs that had to stop
     veh_ids = env.sumo.vehicle.getIDList()
     if veh_ids:
         wt = [traci.vehicle.getWaitingTime(v) for v in veh_ids]
-        waiting_times.append(sum(wt)/len(wt))
+        waiting_times.append(sum(wt) / len(wt))
     else:
         waiting_times.append(0.0)
 
@@ -174,27 +228,27 @@ while not done["__all__"]:
                 ev_waited.add(v)
                 ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
 
-    # build next state
-    raw2    = obs2[tl_id]
+    # Build next state
+    raw2 = obs2[tl_id]
     queues2 = np.array([
         sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes_by_phase[p])
         for p in range(num_phases)
     ], dtype=float)
-    feat2   = queues2 / (queues2.max() + 1e-3)
-    state   = np.concatenate([raw2, feat2])
+    feat2 = queues2 / (queues2.max() + 1e-3)
+    state = np.concatenate([raw2, feat2])
 
-# === done ===
+# === Done ===
 print("\n✅ Evaluation complete")
-print(f"Avg. reward: {np.mean(rewards):.2f}")
+print(f"Avg. shaped reward: {np.mean(rewards):.2f}")
 for p, c in phase_counts.items():
     print(f"Phase {p}: {c} times")
 
-# === performance metrics summary ===
+# === Performance Metrics Summary ===
 summary = {
     "wait time (sec)":     np.mean(waiting_times),
     "travel time (sec)":   np.mean(travel_times),
     "queue length (cars)": np.mean(queue_lengths),
-    "reward":              np.mean(rewards),
+    "reward":       np.mean(rewards),
     "EV stopped count":    len(ev_waited),
     "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
 }
@@ -202,15 +256,15 @@ df_summary = pd.DataFrame([summary])
 print("\nPerformance metrics")
 print(df_summary.to_markdown(index=False, floatfmt=".3f"))
 
-# === plots ===
-plt.figure(figsize=(10,4))
-plt.plot(rewards, label='reward')
+# === Plots ===
+plt.figure(figsize=(10, 4))
+plt.plot(rewards, label='reward', color='tab:blue')
 plt.xlabel("Step"); plt.ylabel("Reward")
-plt.title("DQN Evaluation Rewards")
+plt.title("DQN Evaluation: Rewards")
 plt.grid(True); plt.legend()
 plt.tight_layout()
 
-plt.figure(figsize=(10,4))
+plt.figure(figsize=(10, 4))
 plt.plot(queue_lengths, label='queue', color='orange')
 plt.xlabel("Step"); plt.ylabel("Total queue")
 plt.title("Queue Length Over Time")

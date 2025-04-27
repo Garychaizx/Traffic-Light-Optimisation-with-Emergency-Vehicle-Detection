@@ -11,6 +11,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agents.a2c_agent import A2CAgent
 import librosa
 from tensorflow.keras.models import load_model
+import traci
+import pandas as pd
 
 # === Emergency Detection Functions ===
 def extract_features(audio_file, max_pad_len=862):
@@ -240,7 +242,7 @@ def main():
     # 1) Create SUMO env in GUI mode for visualization
     env = sumo_rl.SumoEnvironment(
         net_file    = "nets/double/network.net.xml",
-        route_file  = "nets/double/doubleRoutes.rou.xml",
+        route_file  = "nets/double/doubleRoutes_high.rou.xml",
         use_gui     = True,
         num_seconds = 5000,
         single_agent=False
@@ -262,6 +264,15 @@ def main():
         agent.actor.eval()
         agent.critic.eval()
         agents[tl] = agent
+
+    # Add these variables to track performance metrics
+    travel_times = []
+    depart_times = {}
+    waiting_times = []
+    ev_waited = set()
+    ev_waiting_times = []
+    shaped_rewards = []
+    queue_lengths = []
 
     # 3) Run one test episode
     obs   = env.reset()
@@ -291,25 +302,25 @@ def main():
             for ev in emergency_vehicles:
                 emergency_vehicles_detected.add(ev['id'])
 
-        # for each TL, pick the highest‑prob valid phase
+        # For each TL, pick the highest-prob valid phase
         for tl, agent in agents.items():
             logits = agent.actor(state[tl].unsqueeze(0)).squeeze(0)
-            probs  = logits.softmax(dim=-1)
+            probs = logits.softmax(dim=-1)
 
-            # mask illegal transitions
-            curr  = env.traffic_signals[tl].green_phase
+            # Mask illegal transitions
+            curr = env.traffic_signals[tl].green_phase
             valid = [p for p in range(probs.size(0))
                      if (curr, p) in env.traffic_signals[tl].yellow_dict]
-            mask  = torch.zeros_like(probs)
+            mask = torch.zeros_like(probs)
             mask[valid] = 1.0
             masked = probs * mask
             if masked.sum() == 0:
-                # fallback uniform on valid
+                # Fallback uniform on valid
                 masked[valid] = 1.0 / len(valid)
             else:
                 masked /= masked.sum()
 
-            # deterministic: pick argmax
+            # Deterministic: pick argmax
             action = int(masked.argmax().item())
             actions[tl] = action
 
@@ -320,37 +331,90 @@ def main():
         for tl in tls:
             phase_counts[tl][actions[tl]] += 1
 
-        # step environment
+        # Step environment
         obs2, reward_dict, done, _ = env.step(actions)
 
-        # metrics
+        # Record average reward
         avg_r = np.mean(list(reward_dict.values()))
         rewards.append(avg_r)
 
-        # average queue length across all TLs
+        # Record average queue length
         total_q = 0
         for tl in tls:
             lanes = env.sumo.trafficlight.getControlledLanes(tl)
             total_q += sum(env.sumo.lane.getLastStepHaltingNumber(l) for l in lanes)
-        queues.append(total_q / len(tls))
+        avg_queue = total_q / len(tls)
+        queue_lengths.append(avg_queue)
 
-        print(f"Step {step:4d} | AvgReward {avg_r: .3f} | AvgQueue {queues[-1]: .1f}")
+        # Record travel times and waiting times
+        for vid in traci.simulation.getDepartedIDList():
+            depart_times[vid] = step
+        for vid in traci.simulation.getArrivedIDList():
+            if vid in depart_times:
+                travel_times.append(step - depart_times[vid])
+                try:
+                    if traci.vehicle.getTypeID(vid) == "emergency_veh":
+                        ev_waiting_times.append(traci.vehicle.getWaitingTime(vid))
+                except:
+                    pass
+                del depart_times[vid]
 
-        # prepare next state
+        vehs = env.sumo.vehicle.getIDList()
+        if vehs:
+            waiting_times.append(np.mean([traci.vehicle.getWaitingTime(v) for v in vehs]))
+        else:
+            waiting_times.append(0.0)
+
+        for v in vehs:
+            if traci.vehicle.getTypeID(v) == "emergency_veh" and traci.vehicle.getWaitingTime(v) > 0:
+                if v not in ev_waited:
+                    ev_waited.add(v)
+                    ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
+
+        # Compute shaped reward
+        Q_before = total_q
+        Q_after = sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes)
+        C_tot = max(0, Q_before - Q_after)
+        phi_diff = Q_before - Q_after
+        r = (
+            -0.3 * Q_before  # QUEUE_PEN
+            + 0.2 * C_tot    # SERVE_BONUS
+            + 0.2 * C_tot    # THROUGHPUT_BONUS
+            - 0.05 * (1 if emergency_override else 0)  # PHASE_CHANGE_PEN
+            + 1.0 * phi_diff  # EMERGENCY_BONUS
+        )
+        shaped_rewards.append(r)
+
+        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {avg_queue: .1f} | Shaped Reward {r: .3f}")
+
+        # Prepare next state
         state = {tl: prepare_obs(obs2, tl, neighbours) for tl in tls}
 
     # 4) Summary
     print("\n✅ Testing complete")
     print(f"Mean reward: {np.mean(rewards):.3f}")
-    print(f"Mean queue:  {np.mean(queues):.1f}\n")
+    print(f"Mean queue:  {np.mean(queue_lengths):.1f}\n")
     print(f"🚑 Emergency vehicle statistics:")
     print(f"   - Detection events: {emergency_detection_count}")
     print(f"   - Unique emergency vehicles detected: {len(emergency_vehicles_detected)}")
-    
+
     for tl in tls:
         print(f"Phase counts for TL {tl}:")
         for p, cnt in phase_counts[tl].items():
             print(f"  Phase {p}: {cnt} times")
+
+    # === Performance metrics table ===
+    summary = {
+        "wait time (sec)":     np.mean(waiting_times),
+        "travel time (sec)":   np.mean(travel_times),
+        "queue length (cars)": np.mean(queue_lengths),
+        "reward":       np.mean(shaped_rewards),
+        "EV stopped count":    len(ev_waited),
+        "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
+    }
+    df = pd.DataFrame([summary])
+    print("\nPerformance metrics")
+    print(df.to_markdown(index=False, floatfmt=".3f"))
 
     # 5) Plots
     plt.figure(figsize=(10,4))

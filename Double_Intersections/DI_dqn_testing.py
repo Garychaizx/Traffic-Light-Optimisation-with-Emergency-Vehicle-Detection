@@ -11,6 +11,8 @@ from agents.dqn_agent import DQNAgent
 # Add these imports at the top of the file
 import librosa
 from tensorflow.keras.models import load_model
+import traci
+import pandas as pd
 
 # Add these functions after the prepare_obs function and before main()
 def extract_features(audio_file, max_pad_len=862):
@@ -235,11 +237,20 @@ def prepare_obs(obs, tl, neighbours, pad_len=165):
         x = x[:pad_len]
     return x
 
+# Add these variables to track performance metrics
+travel_times = []
+depart_times = {}
+waiting_times = []
+ev_waited = set()
+ev_waiting_times = []
+shaped_rewards = []
+queue_lengths = []
+
 def main():
     # 1) Create the SUMO environment with GUI for visualization
     env = sumo_rl.SumoEnvironment(
         net_file    = "nets/double/network.net.xml",
-        route_file  = "nets/double/doubleRoutes.rou.xml",
+        route_file  = "nets/double/doubleRoutes_high.rou.xml",
         use_gui     = True,
         num_seconds = 5000,
         single_agent=False
@@ -291,6 +302,33 @@ def main():
     emergency_detection_count = 0
     emergency_vehicles_detected = set()
 
+    # Add weights for shaping (same as QL)
+    w1, w2, w3 = 0.3, 0.2, 0.2
+    w4, w5, w6 = 0.05, 1.0, 1.0
+
+    # Initialize additional metrics
+    sum_c_sel = 0
+    changes = 0
+
+    # Define all_lanes as the set of all lanes controlled by all traffic lights
+    all_lanes = set()
+    for tl in tls:
+        lanes = env.sumo.trafficlight.getControlledLanes(tl)
+        all_lanes.update(lanes)
+    all_lanes = list(all_lanes)  # Convert to a list for iteration
+
+    # Define lanes_by_phase for each traffic light
+    lanes_by_phase = {}
+    for tl in tls:
+        phases = env.traffic_signals[tl].all_phases
+        lanes_by_phase[tl] = [
+            env.sumo.trafficlight.getControlledLanes(tl)  # All lanes controlled by this traffic light
+            for _ in phases
+        ]
+
+    # Initialize previous actions for each traffic light
+    prev_actions = {tl: None for tl in tls}
+
     while not done["__all__"] and step < MAX_STEPS:
         step += 1
         actions = {}
@@ -318,32 +356,142 @@ def main():
             if tl in actions:
                 phase_counts[tl][actions[tl]] += 1
 
+        # Calculate total queue before
+        Q_before = sum(traci.lane.getLastStepHaltingNumber(l) for l in all_lanes)
+
+        # Calculate vehicles cleared in selected phases
+        cleared_before = {
+            tl: sum(
+                traci.lane.getLastStepHaltingNumber(l)
+                for l in lanes_by_phase[tl][actions[tl]]
+            )
+            for tl in tls
+        }
+
+        # Count phase changes
+        changes = sum(
+            1 for tl in tls
+            if prev_actions[tl] is not None and prev_actions[tl] != actions[tl]
+        )
+
+        # Update previous actions
+        for tl in tls:
+            prev_actions[tl] = actions[tl]
+
         # Step environment
         obs2, reward_dict, done, _ = env.step(actions)
 
-        # record avg reward
+        # Calculate total queue after and throughput
+        Q_after = sum(traci.lane.getLastStepHaltingNumber(l) for l in all_lanes)
+        C_tot = max(0, Q_before - Q_after)
+
+        # Calculate sum of vehicles cleared in selected phases
+        sum_c_sel = sum(
+            max(0, cleared_before[tl] -
+                sum(traci.lane.getLastStepHaltingNumber(l)
+                    for l in lanes_by_phase[tl][actions[tl]]))
+            for tl in tls
+        )
+
+        # Calculate potential-based shaping term
+        phi_diff = Q_before - Q_after
+
+        # Compute shaped reward (same as QL)
+        r = (
+            -w1 * Q_before
+            + w2 * sum_c_sel
+            + w3 * C_tot
+            - w4 * changes
+            + w5 * phi_diff
+            + (w6 if emergency_override else 0.0)
+        )
+        shaped_rewards.append(r)
+
+        # Calculate average reward
+        avg_r = np.mean(list(reward_dict.values())) if reward_dict else 0.0
+        rewards.append(avg_r)
+
+        # Ensure queue_lengths is not empty before accessing the last element
+        avg_queue = queue_lengths[-1] if queue_lengths else 0.0
+
+        # Ensure shaped_rewards is not empty before accessing the last element
+        shaped_reward = r if 'r' in locals() else 0.0
+
+        # Print metrics for debugging
+        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {avg_queue: .1f} | Shaped Reward {shaped_reward: .3f}")
+
+        # Record average reward
         avg_r = np.mean(list(reward_dict.values()))
         rewards.append(avg_r)
 
-        # record avg queue length
+        # Record average queue length
         total_q = 0
         for tl in tls:
             lanes = env.sumo.trafficlight.getControlledLanes(tl)
             total_q += sum(env.sumo.lane.getLastStepHaltingNumber(l) for l in lanes)
-        queues.append(total_q / len(tls))
+        avg_queue = total_q / len(tls)
+        queue_lengths.append(avg_queue)
 
-        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {queues[-1]: .1f}")
+        # Record travel times and waiting times
+        for vid in traci.simulation.getDepartedIDList():
+            depart_times[vid] = step
+        for vid in traci.simulation.getArrivedIDList():
+            if vid in depart_times:
+                travel_times.append(step - depart_times[vid])
+                try:
+                    if traci.vehicle.getTypeID(vid) == "emergency_veh":
+                        ev_waiting_times.append(traci.vehicle.getWaitingTime(vid))
+                except:
+                    pass
+                del depart_times[vid]
 
-        # prepare next state
+        # Calculate throughput (total vehicles that completed their routes)
+        throughput = len(travel_times)
+
+        vehs = env.sumo.vehicle.getIDList()
+        if vehs:
+            waiting_times.append(np.mean([traci.vehicle.getWaitingTime(v) for v in vehs]))
+        else:
+            waiting_times.append(0.0)
+
+        for v in vehs:
+            if traci.vehicle.getTypeID(v) == "emergency_veh" and traci.vehicle.getWaitingTime(v) > 0:
+                if v not in ev_waited:
+                    ev_waited.add(v)
+                    ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
+
+        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {avg_queue: .1f} | Shaped Reward {r: .3f}")
+
+        # Prepare next state
         state = {tl: prepare_obs(obs2, tl, neighbours) for tl in tls}
 
+    # === Summary ===
     print("\n✅ Evaluation complete.")
     print(f"Mean reward over episode: {np.mean(rewards):.3f}")
-    print(f"Mean queue   over episode: {np.mean(queues):.1f}")
+    print(f"Mean queue   over episode: {np.mean(queue_lengths):.1f}")
+    print(f"Total throughput (vehicles): {throughput}")
+    print(f"\n🚑 Emergency vehicle statistics:")
+    print(f"   - Detection events: {emergency_detection_count}")
+    print(f"   - Unique emergency vehicles detected: {len(emergency_vehicles_detected)}")
+
     for tl in tls:
         print(f"\nPhase counts for {tl}:")
         for p, c in phase_counts[tl].items():
             print(f"  Phase {p}: {c}")
+
+    # === Performance metrics table ===
+    summary = {
+        "wait time (sec)":     np.mean(waiting_times),
+        "travel time (sec)":   np.mean(travel_times),
+        "queue length (cars)": np.mean(queue_lengths),
+        "shaped reward":       np.mean(shaped_rewards),
+        "EV stopped count":    len(ev_waited),
+        "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0,
+        "throughput (vehicles)": throughput  # Add throughput to the summary
+    }
+    df = pd.DataFrame([summary])
+    print("\nPerformance metrics")
+    print(df.to_markdown(index=False, floatfmt=".3f"))
 
     # 6) Plotting
     plt.figure(figsize=(10,4))
@@ -352,7 +500,7 @@ def main():
     plt.grid(True); plt.legend()
 
     plt.figure(figsize=(10,4))
-    plt.plot(queues, color="orange", label="Avg Queue")
+    plt.plot(queue_lengths, color="orange", label="Avg Queue")
     plt.xlabel("Step"); plt.ylabel("Queue Length"); plt.title("DQN Double Intersection: Queue")
     plt.grid(True); plt.legend()
 

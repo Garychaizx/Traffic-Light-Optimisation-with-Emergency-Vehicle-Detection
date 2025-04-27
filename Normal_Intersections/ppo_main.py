@@ -1,12 +1,15 @@
-import sumo_rl
+# train_ppo_intersection_with_shaping.py
+
+import os
+import random
 import numpy as np
 import torch
-import random
-from matplotlib import pyplot as plt
-from agents.ppo_agent import PPO  # Assuming you saved your PPO class in agents/ppo.py
+import sumo_rl
+import traci
+from agents.ppo_agent import PPO
 from tensorflow.keras.models import load_model
 import librosa
-import os
+import matplotlib.pyplot as plt
 from generator import TrafficGenerator
 
 # === Siren Detection ===
@@ -16,133 +19,200 @@ def extract_features(audio_file, max_pad_len=862):
         mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=80)
         pad_width = max_pad_len - mfccs.shape[1]
         if pad_width > 0:
-            mfccs = np.pad(mfccs, pad_width=((0, 0), (0, pad_width)), mode='constant')
+            mfccs = np.pad(mfccs, ((0,0),(0,pad_width)), mode='constant')
         else:
             mfccs = mfccs[:, :max_pad_len]
-        features = np.mean(mfccs, axis=1)
-        return features.reshape(1, 1, 80)
-    except Exception as e:
-        print(f"Error extracting audio features: {e}")
+        return np.mean(mfccs, axis=1).reshape(1,1,80)
+    except:
         return None
 
 def detect_siren():
-    audio_path = "dynamic_sounds/ambulance.wav"
-    if not os.path.exists(audio_path):
+    path = "dynamic_sounds/ambulance.wav"
+    if not os.path.exists(path) or siren_model is None:
         return False
-    features = extract_features(audio_path)
-    if features is not None:
-        prediction = siren_model.predict(features)
-        return prediction[0][0] > 0.5
-    return False
+    feats = extract_features(path)
+    if feats is None:
+        return False
+    return float(siren_model.predict(feats)[0][0]) > 0.5
 
-# === Load Siren Model ===
-try:
-    siren_model = load_model('siren_model/best_model.keras')
-    print("✅ Siren model loaded!")
-except Exception as e:
-    print(f"❌ Failed to load siren model: {e}")
-    siren_model = None
+def main():
+    # === load siren model ===
+    try:
+        global siren_model
+        siren_model = load_model('siren_model/best_model.keras')
+        print("✅ Siren model loaded")
+    except:
+        siren_model = None
+        print("⚠️ No siren model, skipping override")
 
-# === Generate Routes ===
-gen = TrafficGenerator(max_steps=5000, n_cars_generated=1000)
-gen.generate_routefile(seed=42)
+    # === generate routes ===
+    gen = TrafficGenerator(max_steps=5000, n_cars_generated=1000)
+    gen.generate_routefile(seed=42)
 
-# === SUMO Env Setup ===
-env = sumo_rl.SumoEnvironment(
-    net_file='nets/intersection/environment.net.xml',
-    route_file='nets/intersection/episode_routes.rou.xml',
-    use_gui=True,
-    num_seconds=5000,
-    single_agent=False
-)
+    # === build SUMO env ===
+    env = sumo_rl.SumoEnvironment(
+        net_file    = 'nets/intersection/environment.net.xml',
+        route_file  = 'nets/intersection/episode_routes.rou.xml',
+        use_gui     = True,
+        num_seconds = 5000,
+        single_agent=False
+    )
+    tl_id = env.ts_ids[0]
+    num_phases = len(env.traffic_signals[tl_id].all_phases)
 
-tl_id = env.ts_ids[0]
-num_phases = len(env.traffic_signals[tl_id].all_phases)
-state_dim = len(env.reset()[tl_id])
-agent = PPO(state_dim, num_phases, hidden_size=64, lr=3e-4, gamma=0.99, clip_ratio=0.2, K_epoch=10)
+    # === grab initial observation & controlled‐lanes info ===
+    obs0 = env.reset()
+    ctrl_lanes = traci.trafficlight.getControlledLanes(tl_id)
+    lanes_by_phase = [
+        [lane for lane, sig in zip(ctrl_lanes, ph.state) if sig == 'G']
+        for ph in env.traffic_signals[tl_id].all_phases
+    ]
 
-# === PPO Training ===
-episode_rewards = []
-phase_visit_count = {p: 0 for p in range(num_phases)}
-max_steps = 5000
-epsilon = 1.0
-min_epsilon = 0.1
-decay = 1 / 10000
+    # === PPO agent ===
+    state_dim = len(obs0[tl_id]) + num_phases
+    agent = PPO(
+        state_dim   = state_dim,
+        action_dim  = num_phases,
+        hidden_size = 64,
+        lr          = 3e-4,
+        gamma       = 0.99,
+        clip_ratio  = 0.2,
+        K_epoch     = 10
+    )
 
-for episode in range(1):
-    observations = env.reset()
-    state = observations[tl_id]
-    episode_reward = 0
+    # === shaping hyper-parameters ===
+    QUEUE_PEN        = 0.3   # w1: penalize total queue
+    SERVE_BONUS      = 0.2   # w2: cleared on chosen phase
+    THROUGHPUT_BONUS = 0.2   # w3: total throughput
+    PHASE_CHANGE_PEN = 0.05  # w4: cost for switching phases
+    EMERGENCY_BONUS  = 10.0  # w6: when siren detected & override taken
 
-    states, actions, old_probs, rewards = [], [], [], []
+    episode_rewards = []
+    epsilon         = 1.0
+    min_epsilon     = 0.1
+    decay           = 1/10000
+
+    # === one training episode ===
+    observations = obs0
+    # build initial state vector
+    raw0 = observations[tl_id]
+    q0   = np.array([
+        sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes_by_phase[p])
+        for p in range(num_phases)
+    ], dtype=float)
+    total_q0 = q0.sum()
+    feat0    = q0/(total_q0+1e-3)
+    state    = np.concatenate([raw0, feat0])
+    prev_phase = env.traffic_signals[tl_id].green_phase
 
     done = {"__all__": False}
-    i = 0
+    step = 0
+    states, actions, old_probs, rewards = [], [], [], []
+    episode_reward = 0.0
+
     while not done["__all__"]:
-        i += 1
+        step += 1
+        # valid next phases
+        curr = env.traffic_signals[tl_id].green_phase
+        valid = [p for p in range(num_phases)
+                 if (curr,p) in env.traffic_signals[tl_id].yellow_dict]
+        if not valid:
+            valid = [curr]
 
-        current_phase = env.traffic_signals[tl_id].green_phase
-        valid_phases = [p for p in range(num_phases) if (current_phase, p) in env.traffic_signals[tl_id].yellow_dict]
-        if not valid_phases:
-            valid_phases = [current_phase]
-
-        # === Emergency Override ===
-        emergency_override = False
-        if siren_model is not None and detect_siren():
-            print("🚨 Emergency detected — overriding PPO decision!")
-            for edge, phase in {"N2TL": 0, "S2TL": 0, "E2TL": 2, "W2TL": 2}.items():
-                for veh_id in env.sumo.vehicle.getIDList():
-                    if env.sumo.vehicle.getRoadID(veh_id).startswith(edge) and env.sumo.vehicle.getTypeID(veh_id) == "emergency_veh":
-                        action = phase
-                        emergency_override = True
-                        break
-                if emergency_override:
-                    break
-
-        if not emergency_override:
-            # Encourage exploration of new phases
-            unexplored = [p for p in valid_phases if phase_visit_count[p] == 0]
-            if unexplored:
-                action = random.choice(unexplored)
-            elif random.random() < epsilon:
-                action = random.choice(valid_phases)
+        # siren override?
+        is_siren = detect_siren()
+        if is_siren:
+            override = 0 if curr in (0,1) else curr
+            action = override
+        else:
+            override = None
+            # exploration or greedy PPO
+            if random.random() < epsilon:
+                action = random.choice(valid)
             else:
-                raw_action = agent.choose_action(state)
-                action = raw_action if raw_action in valid_phases else random.choice(valid_phases)
+                action = agent.choose_action(state)
+                if action not in valid:
+                    action = random.choice(valid)
 
-        phase_visit_count[action] += 1
-        actions_dict = {tl_id: action}
+        # compute shaping components **before** stepping
+        queue_before = np.array([
+            sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes_by_phase[p])
+            for p in range(num_phases)
+        ], dtype=float)
+        total_q_before = queue_before.sum()
+        before_sel     = queue_before[action]
+        change_pen     = PHASE_CHANGE_PEN if action!=prev_phase else 0.0
 
-        next_obs, reward_dict, done, _ = env.step(actions_dict)
-        reward = reward_dict[tl_id]
-        next_state = next_obs[tl_id]
+        # step env
+        next_obs, reward_dict, done, _ = env.step({tl_id: action})
 
-        # Track data for PPO
+        # recompute **after** queues
+        queue_after    = np.array([
+            sum(traci.lane.getLastStepHaltingNumber(l) for l in lanes_by_phase[p])
+            for p in range(num_phases)
+        ], dtype=float)
+        total_q_after = queue_after.sum()
+        cleared_sel   = max(0.0, before_sel - queue_after[action])
+        cleared_tot   = max(0.0, total_q_before - total_q_after)
+
+        # potential-based shaping
+        pot_diff = agent.gamma * (-total_q_after) - (-total_q_before)
+
+        # emergency flag
+        em_flag = 1 if (is_siren and action==override) else 0
+
+        # final shaped reward
+        shaped_r = (
+            - QUEUE_PEN*total_q_before
+            + SERVE_BONUS*cleared_sel
+            + THROUGHPUT_BONUS*cleared_tot
+            + pot_diff
+            - change_pen
+            + EMERGENCY_BONUS*em_flag
+        )
+
+        # store for PPO
         states.append(state)
         actions.append(action)
-        old_probs.append(agent.actor_critic.actor(torch.FloatTensor(state)).squeeze()[action].item())
-        rewards.append(reward)
+        old_probs.append(agent.actor_critic.actor(
+            torch.FloatTensor(state).unsqueeze(0)
+        ).detach().squeeze()[action].item())
+        rewards.append(shaped_r)
+        episode_reward += shaped_r
 
-        state = next_state
-        episode_reward += reward
-        if epsilon > min_epsilon:
-            epsilon -= decay
+        # decay ε
+        epsilon = max(min_epsilon, epsilon - decay)
 
-        print(f"Step {i}: Reward = {reward:.2f}, Action (phase): {action}")
+        # prepare next state
+        raw2 = next_obs[tl_id]
+        feat2= queue_after/(total_q_after+1e-3)
+        state = np.concatenate([raw2, feat2])
+        prev_phase = action
+        observations = next_obs
 
+        print(f"Step {step:4d} | shaped_r {shaped_r: .2f} | ε {epsilon:.3f}")
+
+    # update PPO
     agent.update(states, actions, old_probs, rewards)
     episode_rewards.append(episode_reward)
-    print(f"✅ Episode finished. Total Reward: {episode_reward:.2f}")
+    print(f"✅ Episode done. Total shaped return: {episode_reward:.2f}")
 
-# === Save model ===
-torch.save(agent.actor_critic.state_dict(), 'trained_models/model_ppo.pth')
+    # save
+    os.makedirs("trained_models", exist_ok=True)
+    torch.save(agent.actor_critic.state_dict(), 'trained_models/model_ppo.pth')
 
-# === Plot Reward ===
-plt.figure(figsize=(9, 5))
-plt.plot(episode_rewards)
-plt.title("PPO Episode Rewards with Emergency Override")
-plt.xlabel("Episode")
-plt.ylabel("Total Reward")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+    # plot episode‐level shaped return
+    plt.figure(figsize=(9,5))
+    plt.plot(episode_rewards, marker='o')
+    plt.title("PPO Shaped Episode Returns")
+    plt.xlabel("Episode")
+    plt.ylabel("Sum of Rewards")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    env.close()
+
+
+if __name__=="__main__":
+    main()

@@ -8,6 +8,7 @@ import os
 from agents.a2c_agent import A2CAgent
 from generator import TrafficGenerator
 import librosa
+import traci
 # === Siren Detection ===
 def extract_features(audio_file, max_pad_len=862):
     try:
@@ -68,6 +69,16 @@ rewards_log = []
 done = {"__all__": False}
 i = 0
 
+# Define shaping weights
+QUEUE_PENALTY = 0.3  # Penalize large queues
+CLEAR_BONUS = 0.2    # Bonus for clearing vehicles
+PHASE_CHANGE_PENALTY = 0.05  # Penalize phase changes
+EMERGENCY_BONUS = 1.0  # Bonus for emergency vehicle handling
+
+# Initialize variables for shaping
+prev_total_queue = 0
+gamma = 0.99  # Discount factor for potential-based shaping
+
 while not done["__all__"]:
     i += 1
     current_phase = env.traffic_signals[tl_id].green_phase
@@ -98,21 +109,55 @@ while not done["__all__"]:
     actions = {tl_id: action}
     observations, reward_dict, done, _ = env.step(actions)
     next_state = observations[tl_id]
-    reward = reward_dict[tl_id]
+    base_reward = reward_dict[tl_id]
     done_flag = float(done["__all__"])
 
+    # === Shaped Reward Calculation ===
+    # 1. Queue penalty
+    total_queue = sum(
+        traci.lane.getLastStepHaltingNumber(l)
+        for l in traci.trafficlight.getControlledLanes(tl_id)
+    )
+    queue_penalty = -QUEUE_PENALTY * total_queue
+
+    # 2. Bonus for clearing vehicles
+    cleared_vehicles = max(0, prev_total_queue - total_queue)
+    clear_bonus = CLEAR_BONUS * cleared_vehicles
+
+    # 3. Phase change penalty
+    phase_change_penalty = -PHASE_CHANGE_PENALTY if action != current_phase else 0.0
+
+    # 4. Emergency vehicle bonus
+    emergency_bonus = EMERGENCY_BONUS if emergency_override else 0.0
+
+    # 5. Potential-based shaping
+    potential_diff = gamma * (-total_queue) - (-prev_total_queue)
+
+    # Combine all components into the shaped reward
+    shaped_reward = (
+        base_reward
+        + queue_penalty
+        + clear_bonus
+        + phase_change_penalty
+        + emergency_bonus
+        + potential_diff
+    )
+
+    # Update previous total queue
+    prev_total_queue = total_queue
+
     # Store experience and update the A2C model
-    agent.update(state, action, reward, next_state, done_flag)
+    agent.update(state, action, shaped_reward, next_state, done_flag)
 
     # Set next state
     state = next_state
-    rewards_log.append(reward)
+    rewards_log.append(shaped_reward)
 
-    print(f"Step {i}: Reward = {reward:.2f}, Phase = {action}")
+    print(f"Step {i}: Shaped Reward = {shaped_reward:.2f}, Base Reward = {base_reward:.2f}, Phase = {action}")
 
 # === Save the A2C model ===
-torch.save(agent.actor.state_dict(), 'trained_models/a2c_actor.pth')
-torch.save(agent.critic.state_dict(), 'trained_models/a2c_critic.pth')
+torch.save(agent.actor.state_dict(), 'trained_models/a2c_actorr.pth')
+torch.save(agent.critic.state_dict(), 'trained_models/a2c_criticc.pth')
 
 # === Plot Rewards ===
 plt.figure(figsize=(10, 4))

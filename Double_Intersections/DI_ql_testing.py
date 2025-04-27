@@ -6,11 +6,13 @@ import numpy as np
 import torch
 import sumo_rl
 import matplotlib.pyplot as plt
+import pandas as pd  # for performance metrics table
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agents.ql_agent2 import QlAgent2
 from matplotlib import pyplot as plt
 import librosa
 from tensorflow.keras.models import load_model
+import traci
 
 # === Emergency Detection Functions ===
 def extract_features(audio_file, max_pad_len=862):
@@ -30,11 +32,9 @@ def extract_features(audio_file, max_pad_len=862):
 def detect_siren(model):
     path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'dynamic_sounds', 'ambulance.wav'))
     if model is None or not os.path.exists(path):
-        print(f"❌ Siren model not loaded or audio file missing: {path}")
         return False
     feats = extract_features(path)
     if feats is None:
-        print("❌ Failed to extract features from audio")
         return False
     try:
         prediction = float(model.predict(feats)[0][0])
@@ -42,7 +42,6 @@ def detect_siren(model):
     except Exception as e:
         print(f"❌ Error during siren detection: {e}")
         return False
-    # Update the imports if needed - looks like you already have the needed ones
 
 def detect_emergency_vehicles(env, tls, siren_model):
     """Detect emergency vehicles and report their locations"""
@@ -201,12 +200,9 @@ def handle_emergency_vehicles(env, tls, actions, siren_model):
     return emergency_changes_made
     
 def build_neighbours(env):
-    """Build a map of neighbouring traffic lights by looking
-    for two‐letter edge IDs linking TLs."""
     ts = env.ts_ids
     neigh = {tl: [] for tl in ts}
     for edge_id in env.sumo.edge.getIDList():
-        # look for exactly two‐char edge IDs where both chars are TL IDs
         if len(edge_id) == 2 and edge_id[0] in ts and edge_id[1] in ts:
             a, b = edge_id[0], edge_id[1]
             neigh[a].append(b)
@@ -214,10 +210,9 @@ def build_neighbours(env):
     return {tl: np.array(v) for tl, v in neigh.items()}
 
 def prepare_obs(obs, tl, neighbours, pad_len=165):
-    """Concatenate own obs plus 0.2× neighbours’ obs, then pad/truncate."""
     x = obs[tl].copy()
     for n in neighbours[tl]:
-        x = x + 0.2 * obs[n]
+        x += 0.2 * obs[n]
     if len(x) < pad_len:
         x = np.concatenate([x, np.full(pad_len - len(x), -1.0)])
     else:
@@ -225,31 +220,46 @@ def prepare_obs(obs, tl, neighbours, pad_len=165):
     return torch.FloatTensor(x)
 
 def main():
+    # — load siren model —
     try:
-        siren_model = load_model(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'siren_model/best_model.keras')))
+        siren_model = load_model(os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', 'siren_model', 'best_model.keras')))
         print("✅ Siren model loaded")
     except Exception as e:
         siren_model = None
         print(f"⚠️  No siren model, skipping override: {e}")
-        
-    # 1) create the SUMO env
+
+    # — create SUMO env —
     env = sumo_rl.SumoEnvironment(
-        net_file    = "nets/double/network.net.xml",
-        route_file  = "nets/double/doubleRoutes.rou.xml",
-        use_gui     = True,
-        num_seconds = 5000,
+        net_file="nets/double/network.net.xml",
+        route_file="nets/double/doubleRoutes_low.rou.xml",
+        use_gui=True,
+        num_seconds=5000,
         single_agent=False
     )
-
-    obs = env.reset()
-
-    # 2) build neighbour map
-    neighbours = build_neighbours(env)
-    
-    # Get traffic light IDs
     tls = env.ts_ids
 
-    # 3) load each TL's trained Q‑agent
+    # — build helpers —
+    obs0       = env.reset()
+    neighbours = build_neighbours(env)
+
+    # --- populate lanes_by_phase & all_lanes for both intersections ---
+    lanes_by_phase = {}
+    all_lanes = set()
+    for tl in tls:
+        ctrl_lanes = traci.trafficlight.getControlledLanes(tl)
+        all_lanes.update(ctrl_lanes)
+        phases = env.traffic_signals[tl].all_phases
+        lanes_by_phase[tl] = []
+        for ph in phases:
+            serve = [
+                lane for lane, sig in zip(ctrl_lanes, ph.state)
+                if sig.upper() == "G"
+            ]
+            lanes_by_phase[tl].append(serve)
+    all_lanes = list(all_lanes)
+
+    # — load agents —
     agents = {}
     for tl in tls:
         n_phases = len(env.traffic_signals[tl].all_phases)
@@ -257,130 +267,185 @@ def main():
         ckpt = f"trained_models/ql_double_{tl}.pth"
         agent.model.load_state_dict(torch.load(ckpt))
         agent.model.eval()
-        agent.epsilon = 0.0    # fully greedy
+        agent.epsilon = 0.0
         agents[tl] = agent
 
-    # 4) run one test episode
-    obs = env.reset()
-    state = {tl: prepare_obs(obs, tl, neighbours) for tl in tls}
+    # --- shaping weights ---
+    w1, w2, w3 = 0.3, 0.2, 0.2
+    w4, w5, w6 = 0.05, 1.0, 1.0
 
-    done = {"__all__": False}
-    rewards = []
-    queues  = []
-    phase_counts = {
-        tl: {p: 0 for p in range(len(env.traffic_signals[tl].all_phases))}
-        for tl in tls
-    }
-    
-    # Metrics for emergency vehicles
-    emergency_detection_count = 0
-    emergency_vehicles_detected = set()
+    # — initialize testing state & metrics —
+    obs            = obs0
+    state          = {tl: prepare_obs(obs, tl, neighbours) for tl in tls}
+    done           = {"__all__": False}
+    shaped_rewards = []
+    rewards        = []
+    queue_lengths  = []
+    phase_counts   = {tl: {p: 0 for p in range(len(env.traffic_signals[tl].all_phases))}
+                      for tl in tls}
+    prev_actions   = {tl: None for tl in tls}
+
+    # performance metrics
+    travel_times     = []
+    depart_times     = {}
+    waiting_times    = []
+    ev_waited        = set()
+    ev_waiting_times = []
+
+    emergency_events   = 0
+    detected_emerg_ids = set()
 
     step = 0
     while not done["__all__"] and step < 5000:
         step += 1
 
-        # Detect emergency vehicles (for statistics and visualization)
-        emergency_vehicles = detect_emergency_vehicles(env, tls, siren_model)
-        if emergency_vehicles:
-            emergency_detection_count += 1
-            for ev in emergency_vehicles:
-                emergency_vehicles_detected.add(ev['id'])
+        # — record depart/arrival for travel times & EV wait —
+        for vid in traci.simulation.getDepartedIDList():
+            depart_times[vid] = step
+        for vid in traci.simulation.getArrivedIDList():
+            if vid in depart_times:
+                travel_times.append(step - depart_times[vid])
+                try:
+                    if traci.vehicle.getTypeID(vid) == "emergency_veh":
+                        ev_waiting_times.append(traci.vehicle.getWaitingTime(vid))
+                except:
+                    pass
+                del depart_times[vid]
 
-        # Choose a greedy, valid phase for each TL
+        # — detect emergency vehicles for stats —
+        evs = detect_emergency_vehicles(env, tls, siren_model)
+        if evs:
+            emergency_events += 1
+            detected_emerg_ids.update(ev['id'] for ev in evs)
+
+        # — total queue before —
+        Q_before = sum(traci.lane.getLastStepHaltingNumber(l) for l in all_lanes)
+
+        # — choose actions —
         actions = {}
         for tl, agent in agents.items():
-            curr = env.traffic_signals[tl].green_phase
-            # Valid next phases according to yellow_dict
+            curr  = env.traffic_signals[tl].green_phase
             valid = [
                 p for p in range(agent.output_shape)
                 if (curr, p) in env.traffic_signals[tl].yellow_dict
             ]
+            qvals = agent.model(state[tl])
+            a     = int(torch.argmax(qvals))
+            actions[tl] = a if a in valid else curr
 
-            # Get default action from agent
-            q_vals = agent.model(state[tl])
-            action = int(torch.argmax(q_vals))
-            if action not in valid:
-                action = curr
-            
-            actions[tl] = action
+        # — emergency override —
+        override = handle_emergency_vehicles(env, tls, actions, siren_model)
 
-        # Override with emergency vehicle priorities if needed
-        emergency_override = handle_emergency_vehicles(env, tls, actions, siren_model)
+        # — record per-TL clears before step —
+        cleared_before = {
+            tl: sum(
+                traci.lane.getLastStepHaltingNumber(l)
+                for l in lanes_by_phase[tl][actions[tl]]
+            )
+            for tl in tls
+        }
 
-        # Update phase counts with possibly modified actions
+        # — count phase changes —
+        changes = sum(
+            1 for tl in tls
+            if prev_actions[tl] is not None and prev_actions[tl] != actions[tl]
+        )
+
+        # — update prev_actions & phase_counts —
         for tl in tls:
             phase_counts[tl][actions[tl]] += 1
+            prev_actions[tl] = actions[tl]
 
-        # Step
+        # — step env —
         obs2, reward_dict, done, _ = env.step(actions)
-
-        # Record metrics
         avg_r = np.mean(list(reward_dict.values()))
         rewards.append(avg_r)
 
-        # Average queue over all TLs
+        # — total queue after & throughput —
+        Q_after = sum(traci.lane.getLastStepHaltingNumber(l) for l in all_lanes)
+        C_tot   = max(0, Q_before - Q_after)
+
+        # — queue length metric —
         total_q = 0
         for tl in tls:
             lanes = env.sumo.trafficlight.getControlledLanes(tl)
             total_q += sum(env.sumo.lane.getLastStepHaltingNumber(l) for l in lanes)
-        queues.append(total_q / len(tls))
+        queue_lengths.append(total_q / len(tls))
 
-        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {queues[-1]: .1f}")
+        # — sum of vehicles cleared on each chosen phase —
+        sum_c_sel = sum(
+            max(0, cleared_before[tl] -
+                sum(traci.lane.getLastStepHaltingNumber(l)
+                    for l in lanes_by_phase[tl][actions[tl]]))
+            for tl in tls
+        )
 
-        # Prepare next state
+        # — potential-based shaping term Φ(s_{t+1})−Φ(s_t) = Q_before − Q_after —
+        phi_diff = Q_before - Q_after
+
+        # — assemble shaped reward —
+        r = (
+            -w1 * Q_before
+            + w2 * sum_c_sel
+            + w3 * C_tot
+            - w4 * changes
+            + w5 * phi_diff
+            + (w6 if override else 0.0)
+        )
+        shaped_rewards.append(r)
+
+        # — record waiting times this step & EV stops —
+        vehs = env.sumo.vehicle.getIDList()
+        if vehs:
+            waiting_times.append(np.mean([traci.vehicle.getWaitingTime(v) for v in vehs]))
+        else:
+            waiting_times.append(0.0)
+        for v in vehs:
+            if traci.vehicle.getTypeID(v) == "emergency_veh" and traci.vehicle.getWaitingTime(v) > 0:
+                if v not in ev_waited:
+                    ev_waited.add(v)
+                    ev_waiting_times.append(traci.vehicle.getWaitingTime(v))
+
+        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {queue_lengths[-1]: .1f}")
+
+        # — prepare next state —
         state = {tl: prepare_obs(obs2, tl, neighbours) for tl in tls}
+        obs   = obs2
 
-    # Summary
+    # === Summary ===
     print("\n✅ Testing done")
     print(f"Mean reward over episode: {np.mean(rewards):.3f}")
-    print(f"Mean queue over episode: {np.mean(queues):.1f}")
+    print(f"Mean queue   over episode: {np.mean(queue_lengths):.1f}")
     print(f"\n🚑 Emergency vehicle statistics:")
-    print(f"   - Detection events: {emergency_detection_count}")
-    print(f"   - Unique emergency vehicles detected: {len(emergency_vehicles_detected)}")
-    
+    print(f"   - Detection events: {emergency_events}")
+    print(f"   - Unique emergency vehicles detected: {len(detected_emerg_ids)}")
+
     for tl in tls:
         print(f"\nPhase counts for {tl}:")
         for p, c in phase_counts[tl].items():
             print(f"  Phase {p}: {c}")
 
-    # Rest of the plotting code remains unchanged
-        # step
-        obs2, reward_dict, done, _ = env.step(actions)
+    # === Performance metrics table ===
+    summary = {
+        "wait time (sec)":     np.mean(waiting_times),
+        "travel time (sec)":   np.mean(travel_times),
+        "queue length (cars)": np.mean(queue_lengths),
+        "shaped reward":       np.mean(shaped_rewards),
+        "EV stopped count":    len(ev_waited),
+        "EV avg wait (sec)":   np.mean(ev_waiting_times) if ev_waiting_times else 0.0
+    }
+    df = pd.DataFrame([summary])
+    print("\nPerformance metrics")
+    print(df.to_markdown(index=False, floatfmt=".3f"))
 
-        # record metrics
-        avg_r = np.mean(list(reward_dict.values()))
-        rewards.append(avg_r)
-
-        # average queue over all TLs
-        total_q = 0
-        for tl in env.ts_ids:
-            lanes = env.sumo.trafficlight.getControlledLanes(tl)
-            total_q += sum(env.sumo.lane.getLastStepHaltingNumber(l) for l in lanes)
-        queues.append(total_q / len(env.ts_ids))
-
-        print(f"Step {step:4d} | Avg Reward {avg_r: .3f} | Avg Queue {queues[-1]: .1f}")
-
-        # prepare next state
-        state = {tl: prepare_obs(obs2, tl, neighbours) for tl in env.ts_ids}
-
-    # summary
-    print("\n✅ Testing done")
-    print(f"Mean reward over episode: {np.mean(rewards):.3f}")
-    print(f"Mean queue   over episode: {np.mean(queues):.1f}")
-    for tl in env.ts_ids:
-        print(f"\nPhase counts for {tl}:")
-        for p, c in phase_counts[tl].items():
-            print(f"  Phase {p}: {c}")
-
-    # plots
+    # === Plots ===
     plt.figure(figsize=(10,4))
     plt.plot(rewards, label="Avg Reward")
     plt.xlabel("Step"); plt.ylabel("Reward"); plt.title("QL Testing: Rewards")
     plt.grid(True); plt.legend()
 
     plt.figure(figsize=(10,4))
-    plt.plot(queues, color="orange", label="Avg Queue")
+    plt.plot(queue_lengths, color="orange", label="Avg Queue")
     plt.xlabel("Step"); plt.ylabel("Queue"); plt.title("QL Testing: Queue Lengths")
     plt.grid(True); plt.legend()
 
