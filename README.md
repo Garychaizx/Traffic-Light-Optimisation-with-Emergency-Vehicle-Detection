@@ -19,7 +19,7 @@ This project enhances urban traffic management by optimizing traffic light contr
 - Required libraries listed in `requirements.txt`
 
 ### Installation
-1. Clone the repository:
+1. Clone the repository and install the requirements.txt:
 
 ```bash
 git clone https://github.com/Garychaizx/Traffic-Light-Optimisation-with-Emergency-Vehicle-Detection.git
